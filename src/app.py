@@ -26,7 +26,7 @@ def main(args):
     uploaded_image = st.sidebar.file_uploader("Upload an image")
     if uploaded_image is not None:
         image = Image.open(uploaded_image)
-        st.sidebar.image(image, caption="Uploaded Image", use_column_width=True)
+        st.sidebar.image(image, caption="Uploaded Image", use_container_width=True)
         search_query = image  # Set the search query as the uploaded image
 
     # Run the vector search when the button is clicked
@@ -53,7 +53,7 @@ def main(args):
             image_file = image_files[st.session_state.current_image_index]
             image_path = os.path.join(output_folder, image_file)
             image = Image.open(image_path)
-            st.image(image, caption=image_file, use_column_width=True)
+            st.image(image, caption=image_file, use_container_width=True)
 
             # Navigation buttons for previous and next images
             col1, col2 = st.columns(2)
