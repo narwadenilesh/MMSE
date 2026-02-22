@@ -17,74 +17,66 @@ def run_vector_search(
     output_folder: str = "output",
 ) -> None:
     """
-    This function performs a vector search on the specified database and table using the provided search query.
-    The search can be performed on either text or image data. The function retrieves the top 'limit' number of results
-    and saves the corresponding images in the 'output_folder' directory. The function assumes if the search query ends 
-    with '.jpg' or '.png', it is an image search, otherwise it is a text search.
-    Args:
-        database (str): The path to the database.
-        table_name (str): The name of the table.
-        schema (Schema): The schema to use for converting search results to Pydantic models.
-        search_query (Any): The search query, can be text or image.
-        limit (int, optional): The maximum number of results to return. Defaults to 6.
-        output_folder (str, optional): The folder to save the output images. Defaults to "output".
-
-    Returns:
-        None
-
-    Usage:
-    >>> run_vector_search(database="~/.lancedb", table_name="myntra", schema=Myntra, search_query="Black Kurta")
-
+    Perform vector search using text or image queries.
+    Supports:
+    - Text queries
+    - PIL Images (Streamlit uploads / video frames)
+    - Image file paths (CLI usage)
     """
 
-    # Create the output folder if it does not exist
+    # Recreate output folder cleanly
     if os.path.exists(output_folder):
         for file in os.listdir(output_folder):
             os.remove(os.path.join(output_folder, file))
     else:
         os.makedirs(output_folder)
 
-    # Connect to the lancedb database
+    # Connect to LanceDB
     db = lancedb.connect(database)
-
-    # Open the table
     table = db.open_table(table_name)
 
-    # Check if the search query is an image or text
-    try:
-        if search_query.endswith(".jpg") or search_query.endswith(".png"):
-            search_query = Image.open(search_query)
-        else:
-            search_query = search_query
-    except AttributeError as e:
-        if str(e) == "'JpegImageFile' object has no attribute 'endswith'":
-            print("Running via Streamlit, search query is already an array so skipping opening image using Pillow")
-        else:
-            raise
+    # ✅ SAFE multimodal query handling
+    if isinstance(search_query, Image.Image):
+        # Already a PIL Image → do nothing
+        pass
 
-    # Perform the vector search and retrieve the results
+    elif isinstance(search_query, str) and (
+        search_query.endswith(".jpg") or search_query.endswith(".png")
+    ):
+        # Image path from CLI
+        search_query = Image.open(search_query)
+
+    elif isinstance(search_query, str):
+        # Normal text query → do nothing
+        pass
+
+    else:
+        raise ValueError(f"Unsupported search query type: {type(search_query)}")
+
+    # Perform search
     rs = table.search(search_query).limit(limit).to_pydantic(schema)
 
-    # Save the images to the output folder
-    for i in range(limit):
+    if len(rs) == 0:
+        print("No results found.")
+        return
+
+    # ✅ Save results safely
+    for i, item in enumerate(rs):
         image_path = os.path.join(output_folder, f"image_{i}.jpg")
-        rs[i].image.save(image_path, "JPEG")
+        item.image.save(image_path, "JPEG")
+
+    print(f"Saved {len(rs)} results to '{output_folder}'")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Vector Search")
-    parser.add_argument("--database", type=str, help="Path to the database")
-    parser.add_argument("--table_name", type=str, help="Name of the table")
-    parser.add_argument(
-        "--schema", type=str, help="Schema of the table", default="Myntra"
-    )
-    parser.add_argument("--search_query", type=str, help="Search query")
-    parser.add_argument(
-        "--limit", type=int, default=6, help="Limit the number of results (default: 6)"
-    )
-    parser.add_argument(
-        "--output_folder", type=str, default="output", help="Output folder path"
-    )
+
+    parser.add_argument("--database", type=str, help="Path to database", default="~/.lancedb")
+    parser.add_argument("--table_name", type=str, help="Table name", required=True)
+    parser.add_argument("--schema", type=str, help="Schema name", default="Myntra")
+    parser.add_argument("--search_query", type=str, help="Search query", required=True)
+    parser.add_argument("--limit", type=int, default=6, help="Result limit")
+    parser.add_argument("--output_folder", type=str, default="output", help="Output folder")
 
     args = parser.parse_args()
 
