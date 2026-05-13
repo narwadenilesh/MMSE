@@ -1,7 +1,7 @@
 # Input/Output directories
 input/
 output/
-
+/dataset/
 # Python
 __pycache__/
 *.py[cod]

@@ -1,46 +1,45 @@
-from typing import Any
+from typing import Any, Optional
 
 from lancedb.pydantic import LanceModel, Vector
 from PIL import Image
 
-from embedding_model import register_model
+from .embedding_model import register_model
 
-# Register the OpenAI CLIP model
+# Register CLIP model
 clip = register_model("open-clip")
 
 
 class Myntra(LanceModel):
     """
-    Represents a Myntra Schema.
-
-    Attributes:
-        vector (Vector): The vector representation of the item.
-        image_uri (str): The URI of the item's image.
+    Schema for Myntra products.
     """
 
+    # Vector embedding column
     vector: Vector(clip.ndims()) = clip.VectorField()
+
+    # Image source path
     image_uri: str = clip.SourceField()
+
+    # Metadata fields — must be declared here so to_pydantic() populates them
+    name: str = ""
+    brand: str = ""
+    price: float = 0.0
+    color: str = ""
+    description: str = ""
+    attributes: str = ""
 
     @property
     def image(self):
         return Image.open(self.image_uri)
 
 
-# Function to map schema name to schema class
 def get_schema_by_name(schema_name: str) -> Any:
     """
-    Retrieves the schema object based on the given schema name.
-
-    Args:
-        schema_name (str): The name of the schema.
-
-    Returns:
-        object: The schema object corresponding to the given schema name, or None if not found.
-
-    Usage:
-    >>> schema = get_schema_by_name("Myntra")
+    Return schema class from schema name.
     """
+
     schema_map = {
         "Myntra": Myntra,
     }
+
     return schema_map.get(schema_name)

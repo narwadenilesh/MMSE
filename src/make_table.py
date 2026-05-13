@@ -1,108 +1,169 @@
 import argparse
+import random
 from pathlib import Path
-from random import sample
-from typing import Any
 
 import lancedb
+import numpy as np
 import pandas as pd
+import torch
+from PIL import Image
+from open_clip import create_model_and_transforms
 
-from schema import Myntra
+try:
+    from .embeddings import embed_text
+except ImportError:
+    # Allow direct script execution: `python src/make_table.py`
+    from embeddings import embed_text
+
+
+def _normalize_text(value):
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def _parse_price(value):
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _get_sorted_image_paths(data_path: str):
+    p = Path(data_path).expanduser()
+    paths = [f for f in p.glob("*.jpg") if f.is_file()]
+
+    def sort_key(path: Path):
+        stem = path.stem
+        return int(stem) if stem.isdigit() else stem
+
+    return sorted(paths, key=sort_key)
 
 
 def create_table(
-    database: str,
-    table_name: str,
-    data_path: str,
-    schema: Any = Myntra,
-    mode: str = "overwrite",
-    num_samples: int = 1000,
-) -> None:
-    """
-    Create a table in the specified vector database and add data to it.
+    database,
+    table_name,
+    data_path,
+    metadata_csv,
+    mode="overwrite",
+    num_samples=1000,
+    seed=42,
+):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    Args:
-        database (str): The name of the database to connect to.
-        table_name (str): The name of the table to create.
-        data_path (str): The path to the data directory.
-        schema (Schema, optional): The schema to use for the table. Defaults to Myntra.
-        mode (str, optional): The mode for creating the table. Defaults to "overwrite".
-        num_samples(int, optional): The number of Image samples to be added to the database.
+    model, _, preprocess = create_model_and_transforms(
+        "ViT-B-32", pretrained="laion2b_s34b_b79k"
+    )
+    model = model.to(device)
+    model.eval()
 
-    Returns:
-        None
+    metadata_df = pd.read_csv(metadata_csv).fillna("")
+    # Build fast lookup by image filename from the new dataset schema
+    # (`image`, `display name`, `description`, `category`).
+    if "image" in metadata_df.columns:
+        metadata_by_image = metadata_df.set_index("image", drop=False)
+    else:
+        metadata_by_image = None
 
-    Usage:
-    >>> create_table(database="~/.lancedb"", table_name="myntra", data_path="input")
-    """
-
-    # Connect to the lancedb database
     db = lancedb.connect(database)
 
-    # Check if the table already exists in the database
-    if table_name in db:
-        print(f"Table {table_name} already exists in the database")
-        table = db[table_name]
+    print(f"Creating table '{table_name}'...")
 
-    # if it does not exist then create a new table
-    else:
+    image_paths = _get_sorted_image_paths(data_path)
+    print(f"Found {len(image_paths)} images")
 
-        print(f"Creating table {table_name} in the database")
+    if len(image_paths) > num_samples:
+        image_paths = random.Random(seed).sample(image_paths, num_samples)
+        image_paths = sorted(image_paths, key=lambda path: int(path.stem) if path.stem.isdigit() else path.stem)
 
-        # Create the table with the given schema
-        table = db.create_table(table_name, schema=schema, mode=mode)
+    data = []
+    print("Generating embeddings and attaching metadata...")
 
-        # Define the Path of the images and obtain the Image uri
-        p = Path(data_path).expanduser()
-        uris = [str(f) for f in p.glob("*.jpg")]
-        print(f"Found {len(uris)} images in {p}")
+    for i, img_path in enumerate(image_paths):
+        try:
+            img = preprocess(Image.open(img_path)).unsqueeze(0).to(device)
+            with torch.no_grad():
+                vec = model.encode_image(img).cpu().numpy()[0]
+            # L2-normalise for cosine similarity
+            norm = float(np.linalg.norm(vec))
+            if norm > 0:
+                vec = vec / norm
+            vec = np.asarray(vec, dtype=np.float32)
 
-        # Sample 1000 images from the data by default
-        # Increase this value for more accurate results but
-        # it will take more time to process embeddings
-        uris = sample(uris, num_samples)
+            metadata = {
+                "name": "",
+                "price": 0.0,
+                "color": "",
+                "brand": "",
+                "description": "",
+                "attributes": "",
+            }
 
-        # Add the data to the table
-        print(f"Adding {len(uris)} images to the table")
-        table.add(pd.DataFrame({"image_uri": uris}))
-        print(f"Added {len(uris)} images to the table")
+            row = None
+            img_filename = img_path.name
+            if metadata_by_image is not None and img_filename in metadata_by_image.index:
+                row = metadata_by_image.loc[img_filename]
+            elif i < len(metadata_df):
+                # Fallback for older CSV layouts
+                row = metadata_df.iloc[i]
+
+            if row is not None:
+                metadata = {
+                    # New dataset names
+                    "name": _normalize_text(row.get("display name", row.get("name", ""))),
+                    "price": _parse_price(row.get("price", 0.0)),
+                    "color": _normalize_text(row.get("colour", row.get("color", ""))),
+                    "brand": _normalize_text(row.get("brand", "")),
+                    "description": _normalize_text(row.get("description", "")),
+                    # Use category as a lightweight attribute channel
+                    "attributes": _normalize_text(row.get("category", row.get("p_attributes", ""))),
+                }
+
+            # Compute text embedding for description
+            text_embedding = np.asarray(
+                embed_text(metadata["description"]), dtype=np.float32
+            )
+
+            data.append({
+                "id": i,
+                "vector": vec.tolist(),
+                "image_uri": str(img_path),
+                "text_embedding": text_embedding.tolist(),
+                **metadata,
+            })
+
+            if i % 100 == 0:
+                print(f"Processed {i}/{len(image_paths)}")
+
+        except Exception as e:
+            print(f"Skipping {img_path}: {e}")
+
+    df = pd.DataFrame(data)
+    table = db.create_table(table_name, data=df, mode=mode)
+
+    print("✅ Table created with embeddings and metadata!")
+    print("Columns:", table.to_pandas().columns)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Create a table in lancedb with Myntra data"
-    )
-    parser.add_argument(
-        "--database", help="Path to the lancedb database", default="path/to/database"
-    )
-    parser.add_argument(
-        "--table_name", help="Name of the table to be created", default="my_table"
-    )
-    parser.add_argument(
-        "--data_path", help="Path to the Myntra data images", default="path/to/data"
-    )
-    parser.add_argument(
-        "--schema",
-        help="Schema to use for the table. Defaults to Myntra",
-        default=Myntra,
-    )
-    parser.add_argument(
-        "--mode",
-        help="Mode for creating the table. Defaults to 'overwrite'",
-        default="overwrite",
-    )
-    parser.add_argument(
-        "--num_samples",
-        help="Number of Image samples to be added to the table",
-        type=int,
-        default=1000,
-    )
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--database", default="C:/Users/hp/.lancedb")
+    parser.add_argument("--table_name", default="myntra")
+    parser.add_argument("--data_path", default="dataset/data")
+    parser.add_argument("--metadata_csv", default="dataset/data.csv")
+    parser.add_argument("--mode", default="overwrite")
+    parser.add_argument("--num_samples", type=int, default=1000)
+    parser.add_argument("--seed", type=int, default=42)
+
     args = parser.parse_args()
 
     create_table(
         args.database,
         args.table_name,
         args.data_path,
-        args.schema,
+        args.metadata_csv,
         args.mode,
         args.num_samples,
+        args.seed,
     )
